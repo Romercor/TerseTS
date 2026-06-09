@@ -160,6 +160,7 @@ class Method(Enum):
     MacaqueS = 23
     MacaqueV = 24
     Camel = 25
+    Elf = 26
 
 
 # Public API.

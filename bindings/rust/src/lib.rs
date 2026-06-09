@@ -53,6 +53,7 @@ pub enum Method {
     MacaqueS,
     MacaqueV,
     Camel,
+    Elf,
 }
 
 /// Compress a slice of [`f64`] in `uncompressed_values` to a [`Vec`] of [`u8`] with a TerseTS
