@@ -72,4 +72,42 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_tests.step);
+
+    // Task for running the benchmark harness. The Zig API (`src/tersets.zig`) is exposed to the
+    // benchmark as the `tersets` module so it can call the public compress/decompress.
+    const tersets_module = b.createModule(.{
+        .root_source_file = b.path("src/tersets.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bench_module = b.createModule(.{
+        .root_source_file = b.path("benchmark/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    bench_module.addImport("tersets", tersets_module);
+    const bench = b.addExecutable(.{
+        .name = "bench",
+        .root_module = bench_module,
+    });
+    const run_bench = b.addRunArtifact(bench);
+    if (b.args) |args| run_bench.addArgs(args);
+    const bench_step = b.step("bench", "Run the benchmark (zig build bench -Doptimize=ReleaseFast -- <datasets_dir>)");
+    bench_step.dependOn(&run_bench.step);
+
+    // Task for merging benchmark result CSVs (any number of implementations) into one unified
+    // table. Pure CSV plumbing, so it needs no library module.
+    const compare_module = b.createModule(.{
+        .root_source_file = b.path("benchmark/compare.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const compare = b.addExecutable(.{
+        .name = "compare",
+        .root_module = compare_module,
+    });
+    const run_compare = b.addRunArtifact(compare);
+    if (b.args) |args| run_compare.addArgs(args);
+    const compare_step = b.step("compare", "Merge result CSVs (zig build compare -- <out.csv> <label>=<csv> ...)");
+    compare_step.dependOn(&run_compare.step);
 }
