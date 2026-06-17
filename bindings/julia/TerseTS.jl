@@ -47,6 +47,7 @@ Mirror TerseTS Method Enum.
     MacaqueV = 24
     Camel = 25
     Elf = 26
+    ElfPlus = 27
 end
 
 """

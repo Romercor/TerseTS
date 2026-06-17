@@ -182,6 +182,58 @@ plus bulk bit I/O (see [Optimizations](#optimizations)).
   first value + an end-of-stream marker. On the two datasets where the reference edges TerseTS
   (`SSD-bench`, `Air-pressure`) this framing difference dominates.
 
+## Elf+ results (this machine; Zig `ReleaseFast`, JDK 22)
+
+`Elf+` is the enhanced Elf maintained on the ELF repo's **`dev`** branch (under review for VLDBJ,
+and the variant its README recommends over the paper version). On top of paper Elf it adds
+`beta_star` state reuse (a 1-bit marker when the decimal-significand count is unchanged) and
+lookup-table-driven `beta` computation. TerseTS is compared against that dev-branch reference
+(`ElfCompressor`/`ElfDecompressor`, same variant). Cells are `TerseTS / Java`.
+
+**Means across datasets** (excludes the `init` duplicate)
+
+| Method | ratio | mean bpv | comp ns | decomp ns |
+|--------|-------|----------|---------|-----------|
+| elf_plus | **3.59× / 3.64×** | 25.3 / 25.2 | 23 / 40 | 23 / 24 |
+
+TerseTS reproduces the reference ratio to within ~0.05× (<=0.4 bit/value) on every dataset while
+compressing **~1.7× faster** (decompress on par). Unlike paper Elf — where TerseTS edges ahead via
+the implicit-leading-1 XOR bit — here the dev reference uses that same trick, so the remaining gap
+is TerseTS's per-block framing (`u64` count + raw first value + method byte; the raw, un-erased
+first value also seeds the XOR predictor, costing a little body on erasable data). Elf+ beats paper
+Elf by **~19%** mean ratio (3.59× vs 3.01×), most on decimal-heavy series.
+
+**elf_plus** (sorted by ratio)
+
+| dataset | ratio | mean bpv | std | comp ns | decomp ns |
+|---|---|---|---|---|---|
+| PM10-dust | 8.24x / 8.48x | 7.76 / 7.55 | 2.20 / 2.21 | 16 / 25 | 18 / 18 |
+| IR-bio-temp | 6.31x / 6.46x | 10.14 / 9.91 | 1.50 / 1.58 | 20 / 31 | 20 / 21 |
+| Stocks-USA | 5.64x / 5.73x | 11.35 / 11.18 | 2.57 / 2.58 | 22 / 34 | 21 / 21 |
+| Stocks-UK | 5.39x / 5.46x | 11.86 / 11.72 | 1.22 / 1.22 | 27 / 40 | 21 / 22 |
+| Wind-Speed | 5.03x / 5.11x | 12.73 / 12.53 | 0.42 / 0.43 | 22 / 35 | 23 / 24 |
+| City-temp | 4.76x / 4.82x | 13.44 / 13.28 | 2.33 / 2.32 | 20 / 31 | 20 / 20 |
+| Food-price | 4.65x / 4.69x | 13.77 / 13.64 | 2.53 / 2.54 | 23 / 37 | 20 / 21 |
+| Stocks-DE | 4.50x / 4.55x | 14.22 / 14.05 | 3.04 / 3.04 | 24 / 39 | 23 / 24 |
+| SSD-bench | 4.22x / 4.31x | 15.17 / 14.84 | 1.85 / 1.66 | 17 / 27 | 18 / 18 |
+| Dew-point-temp | 4.04x / 4.09x | 15.83 / 15.66 | 1.47 / 1.47 | 21 / 33 | 22 / 21 |
+| Air-pressure | 3.91x / 4.01x | 16.37 / 15.97 | 0.98 / 1.00 | 16 / 31 | 18 / 21 |
+| electric_vehicle_charging | 3.50x / 3.56x | 18.27 / 17.96 | 1.19 / 1.26 | 17 / 28 | 22 / 17 |
+| Blockchain-tr | 3.38x / 3.41x | 18.92 / 18.75 | 1.79 / 1.80 | 24 / 38 | 23 / 24 |
+| Bird-migration | 2.70x / 2.72x | 23.68 / 23.52 | 2.69 / 2.69 | 30 / 45 | 25 / 26 |
+| Bitcoin-price | 2.05x / 2.06x | 31.16 / 31.02 | 1.64 / 1.64 | 22 / 35 | 24 / 22 |
+| City-lat | 2.00x / 2.01x | 31.93 / 31.78 | 1.56 / 1.56 | 28 / 42 | 26 / 27 |
+| Basel-temp | 1.94x / 1.95x | 33.02 / 32.86 | 1.25 / 1.27 | 24 / 39 | 26 / 26 |
+| Basel-wind | 1.82x / 1.83x | 35.08 / 34.93 | 0.58 / 0.58 | 29 / 50 | 28 / 30 |
+| City-lon | 1.69x / 1.70x | 37.87 / 37.72 | 0.74 / 0.74 | 34 / 56 | 39 / 34 |
+| Air-sensor | 1.17x / 1.18x | 54.52 / 54.45 | 2.88 / 2.88 | 22 / 82 | 23 / 43 |
+| POI-lat | 1.03x / 1.03x | 62.05 / 61.98 | 0.27 / 0.27 | 22 / 44 | 26 / 26 |
+| POI-lon | 0.94x / 0.94x | 68.09 / 68.02 | 0.15 / 0.15 | 31 / 61 | 27 / 29 |
+
+> Built from the ELF repo's `dev` branch (`mvn dependency:copy-dependencies` + `javac`), with the
+> boxing-free `nextValuePrimitive()` decode path added to the reference (as for paper Elf, see
+> [Optimizations](#optimizations) E3) so the decode comparison times the codec, not Java's boxing.
+
 ## Optimizations
 
 Each step keeps output byte-identical (ratios unchanged) and round-trips bit-exact. Numbers are

@@ -57,6 +57,7 @@ const delta_encoding = @import("lossless_compression/bitpacked_delta_encoding.zi
 const chimp64 = @import("lossless_compression/chimp64.zig");
 const chimp128 = @import("lossless_compression/chimp128.zig");
 const elf = @import("lossless_compression/elf.zig");
+const elf_plus = @import("lossless_compression/elf_plus.zig");
 
 const extractors = @import("utilities/extractors.zig");
 const tester = @import("tester.zig");
@@ -109,6 +110,7 @@ pub const Method = enum {
     MacaqueV,
     Camel,
     Elf,
+    ElfPlus,
 };
 
 /// Compress `uncompressed_values` using `method` and its `configuration` and returns the results
@@ -348,6 +350,14 @@ pub fn compress(
                 configuration,
             );
         },
+        .ElfPlus => {
+            try elf_plus.compress(
+                allocator,
+                uncompressed_values,
+                &compressed_values,
+                configuration,
+            );
+        },
     }
     try compressed_values.append(allocator, @intFromEnum(method));
     return compressed_values;
@@ -454,6 +464,9 @@ pub fn decompress(
         },
         .Elf => {
             try elf.decompress(allocator, compressed_values_slice, &decompressed_values);
+        },
+        .ElfPlus => {
+            try elf_plus.decompress(allocator, compressed_values_slice, &decompressed_values);
         },
     }
 
@@ -606,6 +619,9 @@ pub fn extract(
         .Elf => {
             return Error.UnsupportedMethod;
         },
+        .ElfPlus => {
+            return Error.UnsupportedMethod;
+        },
     }
 }
 
@@ -749,6 +765,9 @@ pub fn rebuild(
         .Elf => {
             return Error.UnsupportedMethod;
         },
+        .ElfPlus => {
+            return Error.UnsupportedMethod;
+        },
     }
     try compressed_values.append(allocator, @intFromEnum(method));
     return compressed_values;
@@ -790,7 +809,8 @@ test "extract and rebuild works for any compression method supported" {
             method == Method.MacaqueV or
             method == Method.Chimp128 or
             method == Method.Camel or
-            method == Method.Elf)
+            method == Method.Elf or
+            method == Method.ElfPlus)
         {
             // These compression methods are not supported for extraction
             // of the coefficients and indices. This is because even small

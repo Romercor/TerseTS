@@ -36,6 +36,7 @@ enum Method {
   MacaqueV                      = 24,
   Camel                         = 25,
   Elf                           = 26,
+  ElfPlus                       = 27,
 };
 
 // A pointer to uncompressed values and the number of values.

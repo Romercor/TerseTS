@@ -27,6 +27,7 @@ const methods = [_]Codec{
     .{ .name = "chimp64", .method = .Chimp64 },
     .{ .name = "chimp128", .method = .Chimp128 },
     .{ .name = "elf", .method = .Elf },
+    .{ .name = "elf_plus", .method = .ElfPlus },
 };
 
 const BLOCK: usize = 1000;

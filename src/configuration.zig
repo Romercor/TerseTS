@@ -217,6 +217,7 @@ pub fn defaultConfigurationBuilder(
         .BitPackedDeltaEncoding,
         .Camel,
         .Elf,
+        .ElfPlus,
         => try allocator.dupe(u8, "{}"),
     };
 }
