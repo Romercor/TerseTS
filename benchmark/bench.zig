@@ -1,4 +1,4 @@
-// Benchmark for TerseTS lossless float codecs against CSV datasets.
+// Benchmark for TerseTS float codecs (lossless and lossy) against CSV datasets.
 //
 // Methodology mirrors the reference Java benchmark (gr.aueb.delorean.chimp
 // TestDoublePrecision): each dataset is split into fixed-size blocks, a fresh
@@ -7,7 +7,15 @@
 // throughput are reported as ns/value (best of several passes).
 //
 // Codecs go through the public TerseTS API (tersets.compress/decompress with a
-// Method). Adding a codec is one line in `methods` below.
+// Method). Each codec carries its own JSON config (matching the schema in
+// TerseTS's configuration.zig) and a verification mode:
+//   - .bit_exact  -> lossless: round-trip must be identical bit-for-bit.
+//   - .max_abs    -> lossy: require max |decoded - original| <= bound; report
+//                    the measured max/mean absolute error.
+//   - .measure    -> lossy: measure max/mean absolute error but don't enforce a
+//                    pointwise bound (for methods whose guarantee isn't pointwise
+//                    absolute, e.g. RMSE-aggregate, histogram, AUC, DFT).
+// Adding a codec is one line in `methods` below.
 //
 // Build/run: zig build bench -Doptimize=ReleaseFast -- <datasets_dir> [out_csv]
 
@@ -17,9 +25,24 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const tersets = @import("tersets");
 
+// How a codec's round-trip is checked.
+const Verify = union(enum) {
+    // Lossless: decoded values must equal the originals bit-for-bit.
+    bit_exact,
+    // Lossy: require max |decoded - original| <= bound (plus a tiny float slack).
+    max_abs: f64,
+    // Lossy: measure error only; never fail on magnitude.
+    measure,
+};
+
 const Codec = struct {
     name: []const u8,
     method: tersets.Method,
+    // JSON config passed to tersets.compress. Must match the method's schema in
+    // configuration.zig (e.g. {"abs_error_bound": 0.1}, {"decimal_precision": 4}).
+    config: []const u8 = "{}",
+    // Round-trip verification mode. Defaults to lossless bit-exact.
+    verify: Verify = .bit_exact,
 };
 
 // Registry of codecs to benchmark. Add a line to extend.
@@ -28,10 +51,19 @@ const methods = [_]Codec{
     .{ .name = "chimp128", .method = .Chimp128 },
     .{ .name = "elf", .method = .Elf },
     .{ .name = "elf_plus", .method = .ElfPlus },
+    // Camel is lossy and precision-based: {"decimal_precision": N} keeps N decimal
+    // digits, so the pointwise error is bounded by ~10^-N. 1e-4 for N=4 is a
+    // conservative sanity bound (tighten to 5e-5 if Camel rounds to nearest, or
+    // switch to .measure to just record the error without enforcing a bound).
+    .{ .name = "camel", .method = .Camel, .config = "{\"decimal_precision\":4}", .verify = .{ .max_abs = 1e-4 } },
 };
 
 const BLOCK: usize = 1000;
 const TIME_REPS: usize = 5;
+
+// Slack above a .max_abs bound to absorb floating-point rounding in the codec's
+// own bound check. Kept tiny so it never masks a genuine violation.
+const ERROR_TOL: f64 = 1e-9;
 
 const Result = struct {
     values: usize,
@@ -48,6 +80,12 @@ const Result = struct {
     compression_ratio: f64,
     compress_ns_per_value: f64,
     decompress_ns_per_value: f64,
+    // Accuracy of the round-trip. For lossless codecs these are zero. For lossy codecs
+    // error_bound is the enforced pointwise bound (0 when .measure), and max/mean_abs_error
+    // summarize |decoded - original| across all values.
+    error_bound: f64,
+    max_abs_error: f64,
+    mean_abs_error: f64,
 };
 
 fn parseLineValue(raw: []const u8) ?f64 {
@@ -71,7 +109,14 @@ fn readValues(io: Io, allocator: Allocator, dir: Io.Dir, sub_path: []const u8) !
     return values;
 }
 
-fn benchMethod(io: Io, allocator: Allocator, values: []const f64, method: tersets.Method) !Result {
+fn benchMethod(io: Io, allocator: Allocator, values: []const f64, codec: Codec) !Result {
+    const method = codec.method;
+    const is_lossless = codec.verify == .bit_exact;
+    const verify_bound: f64 = switch (codec.verify) {
+        .max_abs => |bound| bound,
+        else => 0,
+    };
+
     const num_blocks = values.len / BLOCK;
     const total_values = num_blocks * BLOCK;
 
@@ -87,22 +132,42 @@ fn benchMethod(io: Io, allocator: Allocator, values: []const f64, method: terset
     defer per_block_bpv.deinit(allocator);
 
     var total_bytes: usize = 0;
+    // Accuracy accumulators (stay zero for lossless codecs).
+    var max_abs_error: f64 = 0;
+    var abs_error_sum: f64 = 0;
+
     var b: usize = 0;
     while (b < num_blocks) : (b += 1) {
         const block = values[b * BLOCK .. b * BLOCK + BLOCK];
 
-        var compressed = try tersets.compress(allocator, block, method, "{}");
+        var compressed = try tersets.compress(allocator, block, method, codec.config);
         defer compressed.deinit(allocator);
         total_bytes += compressed.items.len;
         try per_block_bpv.append(allocator, @as(f64, @floatFromInt(compressed.items.len * 8)) / @as(f64, BLOCK));
         try blobs.append(allocator, try allocator.dupe(u8, compressed.items));
 
-        // Correctness: round-trip must be bit-exact.
+        // Correctness: lossless must be bit-exact; lossy is verified/measured per its mode.
         var dec = try tersets.decompress(allocator, compressed.items);
         defer dec.deinit(allocator);
         if (dec.items.len != block.len) return error.RoundTripLengthMismatch;
         for (block, dec.items) |expected, actual| {
-            if (@as(u64, @bitCast(expected)) != @as(u64, @bitCast(actual))) return error.RoundTripValueMismatch;
+            switch (codec.verify) {
+                .bit_exact => {
+                    if (@as(u64, @bitCast(expected)) != @as(u64, @bitCast(actual)))
+                        return error.RoundTripValueMismatch;
+                },
+                .max_abs => |bound| {
+                    const abs_err = @abs(expected - actual);
+                    if (abs_err > bound + ERROR_TOL) return error.ErrorBoundExceeded;
+                    max_abs_error = @max(max_abs_error, abs_err);
+                    abs_error_sum += abs_err;
+                },
+                .measure => {
+                    const abs_err = @abs(expected - actual);
+                    max_abs_error = @max(max_abs_error, abs_err);
+                    abs_error_sum += abs_err;
+                },
+            }
         }
     }
 
@@ -114,7 +179,7 @@ fn benchMethod(io: Io, allocator: Allocator, values: []const f64, method: terset
         b = 0;
         while (b < num_blocks) : (b += 1) {
             const block = values[b * BLOCK .. b * BLOCK + BLOCK];
-            var compressed = try tersets.compress(allocator, block, method, "{}");
+            var compressed = try tersets.compress(allocator, block, method, codec.config);
             compressed.deinit(allocator);
         }
         best_compress = @min(best_compress, @as(u64, @intCast(start.untilNow(io).raw.nanoseconds)));
@@ -147,6 +212,9 @@ fn benchMethod(io: Io, allocator: Allocator, values: []const f64, method: terset
         .compression_ratio = 64.0 / bits_per_value,
         .compress_ns_per_value = @as(f64, @floatFromInt(best_compress)) / fv,
         .decompress_ns_per_value = @as(f64, @floatFromInt(best_decompress)) / fv,
+        .error_bound = verify_bound,
+        .max_abs_error = max_abs_error,
+        .mean_abs_error = if (is_lossless) 0 else abs_error_sum / fv,
     };
 }
 
@@ -218,7 +286,7 @@ pub fn main(init: std.process.Init) !void {
 
     var sb = ArrayList(u8).empty;
     defer sb.deinit(allocator);
-    try appendLine(&sb, allocator, "dataset,method,values,blocks,bits_per_value,compression_ratio,bpv_min,bpv_median,bpv_max,bpv_std,compress_ns_per_value,decompress_ns_per_value\n", .{});
+    try appendLine(&sb, allocator, "dataset,method,values,blocks,bits_per_value,compression_ratio,bpv_min,bpv_median,bpv_max,bpv_std,compress_ns_per_value,decompress_ns_per_value,error_bound,max_abs_error,mean_abs_error\n", .{});
 
     for (names.items) |name| {
         var values = try readValues(io, allocator, data_dir, name);
@@ -227,8 +295,14 @@ pub fn main(init: std.process.Init) !void {
 
         const dataset = name[0 .. name.len - 4];
         for (methods) |codec| {
-            const result = try benchMethod(io, allocator, values.items, codec.method);
-            try appendLine(&sb, allocator, "{s},{s},{d},{d},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.1},{d:.1}\n", .{
+            // Don't let one misconfigured or failing codec abort the whole run:
+            // log it and move on (e.g. a wrong config key surfaces as InvalidConfiguration,
+            // a lossy codec breaking its bound surfaces as ErrorBoundExceeded).
+            const result = benchMethod(io, allocator, values.items, codec) catch |err| {
+                std.debug.print("skip {s}/{s}: {s}\n", .{ dataset, codec.name, @errorName(err) });
+                continue;
+            };
+            try appendLine(&sb, allocator, "{s},{s},{d},{d},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.3},{d:.1},{d:.1},{d},{e:.3},{e:.3}\n", .{
                 dataset,
                 codec.name,
                 result.values,
@@ -241,6 +315,9 @@ pub fn main(init: std.process.Init) !void {
                 result.bpv_std,
                 result.compress_ns_per_value,
                 result.decompress_ns_per_value,
+                result.error_bound,
+                result.max_abs_error,
+                result.mean_abs_error,
             });
         }
     }
