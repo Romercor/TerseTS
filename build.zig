@@ -80,6 +80,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // DiscreteFourierTransform depends on the PocketFFT C library, same as root_module above.
+    tersets_module.addIncludePath(pocketfft_path);
+    tersets_module.addCSourceFile(.{ .file = pocketfft_c_path });
+    tersets_module.link_libc = true;
     const bench_module = b.createModule(.{
         .root_source_file = b.path("benchmark/bench.zig"),
         .target = target,
