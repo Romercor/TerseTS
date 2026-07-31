@@ -56,6 +56,8 @@ const rle_encoding = @import("lossless_compression/run_length_encoding.zig");
 const delta_encoding = @import("lossless_compression/bitpacked_delta_encoding.zig");
 const chimp64 = @import("lossless_compression/chimp64.zig");
 const chimp128 = @import("lossless_compression/chimp128.zig");
+const elf = @import("lossless_compression/elf.zig");
+const lttb = @import("lossy_compression/line_simplification/largest_triangle_three_buckets.zig");
 
 const extractors = @import("utilities/extractors.zig");
 const tester = @import("tester.zig");
@@ -106,6 +108,8 @@ pub const Method = enum {
     DiscreteFourierTransform,
     MacaqueS,
     MacaqueV,
+    LargestTriangleThreeBuckets,
+    Elf,
     Camel,
 };
 
@@ -330,8 +334,22 @@ pub fn compress(
                 configuration,
             );
         },
-        .Camel => {
-            try camel.compress(
+        .Elf => {
+            try elf.compress(
+                allocator,
+                uncompressed_values,
+                &compressed_values,
+                configuration,
+            );
+        },
+        .Uncompressed => {
+            for (uncompressed_values) |value| {
+                const value_as_bytes: [8]u8 = @bitCast(value);
+                try compressed_values.appendSlice(allocator, value_as_bytes[0..]);
+            }
+        },
+        .LargestTriangleThreeBuckets => {
+            try lttb.compress(
                 allocator,
                 uncompressed_values,
                 &compressed_values,
@@ -439,8 +457,19 @@ pub fn decompress(
         .MacaqueV => {
             try macaque.decompressMacaqueV(allocator, compressed_values_slice, &decompressed_values);
         },
-        .Camel => {
-            try camel.decompress(allocator, compressed_values_slice, &decompressed_values);
+        .Elf => {
+            try elf.decompress(allocator, compressed_values_slice, &decompressed_values);
+        },
+        .Uncompressed => {
+            if (compressed_values_slice.len % 8 != 0) return Error.CorruptedCompressedData;
+            var offset: usize = 0;
+            while (offset < compressed_values_slice.len) : (offset += 8) {
+                const value: f64 = @bitCast(compressed_values_slice[offset..][0..8].*);
+                try decompressed_values.append(allocator, value);
+            }
+        },
+        .LargestTriangleThreeBuckets => {
+            try lttb.decompress(allocator, compressed_values_slice, &decompressed_values);
         },
     }
 
@@ -573,6 +602,14 @@ pub fn extract(
                 coefficients,
             );
         },
+        .LargestTriangleThreeBuckets => {
+            try lttb.extract(
+                allocator,
+                compressed_values_slice,
+                indices,
+                coefficients,
+            );
+        },
         // For the following three methods, it is not possible to guarantee
         // that the pipeline will work as intended. This is because even small
         // chages in the compressed representation can lead to large differences
@@ -587,7 +624,20 @@ pub fn extract(
         // corrupted streams or misinterpretation of the data during decompression.
         // In case of RLE, modifying the coefficients can disrupt the run-length
         // encoding scheme, also leading to incorrect decompression results.
-        .Uncompressed, .BitPackedQuantization, .BitPackedDeltaEncoding, .SerfQT, .RunLengthEncoding, .BitPackedBUFF, .Chimp64, .Chimp128, .MacaqueS, .MacaqueV, .Camel => {
+        .Uncompressed,
+        .BitPackedQuantization,
+        .BitPackedDeltaEncoding,
+        .SerfQT,
+        .RunLengthEncoding,
+        .BitPackedBUFF,
+        .Chimp64,
+        .Chimp128,
+        .MacaqueS,
+        .MacaqueV,
+        => {
+            return Error.UnsupportedMethod;
+        },
+        .Elf => {
             return Error.UnsupportedMethod;
         },
     }
@@ -713,6 +763,14 @@ pub fn rebuild(
                 &compressed_values,
             );
         },
+        .LargestTriangleThreeBuckets => {
+            try lttb.rebuild(
+                allocator,
+                indices,
+                coefficients,
+                &compressed_values,
+            );
+        },
         // For the following three methods, it is not possible to guarantee
         // that the pipeline will work as intended. This is because even small
         // chages in the compressed representation can lead to large differences
@@ -727,7 +785,20 @@ pub fn rebuild(
         // corrupted streams or misinterpretation of the data during decompression.
         // In case of RLE, modifying the coefficients can disrupt the run-length
         // encoding scheme, also leading to incorrect decompression results.
-        .Uncompressed, .BitPackedQuantization, .BitPackedDeltaEncoding, .BitPackedBUFF, .SerfQT, .RunLengthEncoding, .Chimp64, .Chimp128, .MacaqueS, .MacaqueV, .Camel => {
+        .Uncompressed,
+        .BitPackedQuantization,
+        .BitPackedDeltaEncoding,
+        .BitPackedBUFF,
+        .SerfQT,
+        .RunLengthEncoding,
+        .Chimp64,
+        .Chimp128,
+        .MacaqueS,
+        .MacaqueV,
+        => {
+            return Error.UnsupportedMethod;
+        },
+        .Elf => {
             return Error.UnsupportedMethod;
         },
     }
@@ -769,8 +840,7 @@ test "extract and rebuild works for any compression method supported" {
             method == Method.Chimp128 or
             method == Method.MacaqueS or
             method == Method.MacaqueV or
-            method == Method.Chimp128 or
-            method == Method.Camel)
+            method == Method.Elf)
         {
             // These compression methods are not supported for extraction
             // of the coefficients and indices. This is because even small

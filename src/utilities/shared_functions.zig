@@ -380,6 +380,41 @@ pub fn bitsNeededUnsigned(value: u64) u8 {
     return @intCast(64 - @clz(value));
 }
 
+/// Return the absolute area of the triangle defined by three points. The points are represented as
+/// `DiscretePoint` structs, which contain an `index` and a `value`. The `index` represents the
+/// position of the point in the original uncompressed series, while the `value` represents the value
+/// of the point. The function calculates the area using the formula for the area of a triangle given
+/// by three points in a 2D plane, where the x-coordinate is given by the `index` and the y-coordinate
+/// is given by the `value`. The function returns the absolute value of the area.
+pub fn calculateTriangleArea(left_point: shared_structs.DiscretePoint, central_point: shared_structs.DiscretePoint, right_point: shared_structs.DiscretePoint) f64 {
+    const x1: f64 = @floatFromInt(left_point.index);
+    const y1: f64 = left_point.value;
+    const x2: f64 = @floatFromInt(central_point.index);
+    const y2: f64 = central_point.value;
+    const x3: f64 = @floatFromInt(right_point.index);
+    const y3: f64 = right_point.value;
+
+    return @abs((x1 * (y2 - y3) + x2 * (y3 - y1) + x3 * (y1 - y2)) / 2.0);
+}
+
+/// Return the index of the largest `shared_structs.leading_zero_buckets` entry that does not
+/// exceed `leading_zeros`. Chimp-family streams store this index in
+/// `shared_structs.leading_zero_bucket_bits` bits.
+pub fn leadingZeroBucketIndex(leading_zeros: u6) u3 {
+    return shared_structs.leading_zero_bucket_index[leading_zeros];
+}
+
+/// Write the Chimp-family end-of-stream marker with `bit_writer`: a "stored meaningful bits"
+/// marker whose meaningful-bit count is 0, preceded by `ring_slot_bits` zero bits for the ring
+/// slot (0 for Chimp64). Real values always store at least one meaningful bit, so a count of 0
+/// unambiguously ends the stream and the decoder needs no explicit value count.
+pub fn writeChimpEndMarker(bit_writer: *shared_structs.BulkBitWriter, ring_slot_bits: u16) Error!void {
+    try bit_writer.writeBits(@as(u2, 0b01), 2);
+    if (ring_slot_bits > 0) try bit_writer.writeBits(@as(u7, 0), ring_slot_bits);
+    try bit_writer.writeBits(@as(u3, 0), shared_structs.leading_zero_bucket_bits);
+    try bit_writer.writeBits(@as(u6, 0), 6);
+}
+
 test "zigzag can encode and decode small signed integers correctly" {
     const default_random = tester.getDefaultRandomGenerator();
     const number_of_tests = tester.generateNumberOfValues(default_random);
