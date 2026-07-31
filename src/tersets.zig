@@ -41,6 +41,7 @@ const bitpacked_quantization = @import("lossy_compression/value_representation/b
 const serfqt = @import("lossy_compression/value_representation/serf_qt.zig");
 const buff = @import("lossy_compression/value_representation/bounded_fast_floats.zig");
 const macaque = @import("lossy_compression/value_representation/macaque.zig");
+const camel = @import("lossy_compression/value_representation/camel.zig");
 
 // Import line simplification methods.
 const vw = @import("lossy_compression/line_simplification/visvalingam_whyatt.zig");
@@ -55,7 +56,6 @@ const rle_encoding = @import("lossless_compression/run_length_encoding.zig");
 const delta_encoding = @import("lossless_compression/bitpacked_delta_encoding.zig");
 const chimp64 = @import("lossless_compression/chimp64.zig");
 const chimp128 = @import("lossless_compression/chimp128.zig");
-const camel = @import("lossless_compression/camel.zig");
 
 const extractors = @import("utilities/extractors.zig");
 const tester = @import("tester.zig");

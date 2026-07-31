@@ -209,13 +209,21 @@ pub fn defaultConfigurationBuilder(
             );
         },
 
+        .Camel => blk: {
+            const precision: u8 = 4;
+            break :blk try std.fmt.allocPrint(
+                allocator,
+                "{{\"decimal_precision\": {d}}}",
+                .{precision},
+            );
+        },
+
         // Methods with empty configuration.
         .Uncompressed,
         .RunLengthEncoding,
         .Chimp64,
         .Chimp128,
         .BitPackedDeltaEncoding,
-        .Camel,
         => try allocator.dupe(u8, "{}"),
     };
 }
