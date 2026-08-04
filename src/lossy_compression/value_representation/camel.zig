@@ -19,19 +19,12 @@
 //! This implementation also follows the Java reference implementation published by the paper's
 //! authors: https://github.com/yoyo185644/camel.
 //!
-//! The paper treats Camel as lossless in its bounded-decimal data model when the configured decimal
-//! precision covers every input value. However, TerseTS accepts arbitrary binary `f64` values and
-//! cannot assume that they all satisfy a particular decimal-precision bound. To solve this problem,
-//! TerseTS leaves values within the selected precision unchanged and rounds values that exceed it
-//! before applying Camel's representation. TerseTS therefore exposes Camel as a lossy value
-//! representation method and requires callers to choose `decimal_precision` explicitly. Supplying
-//! the known maximum of one to four decimal places avoids intentional quantization and provides
-//! Camel's conditional, decimal-domain lossless mode. It is not a promise that every reconstructed
-//! IEEE-754 bit pattern is identical: floating-point decomposition and recomposition can differ by
-//! an ULP. Callers requiring bitwise losslessness should use Chimp64 or Chimp128. For unrestricted
-//! `f64` input, Camel's configuration is an explicit accuracy versus compression-ratio choice with
-//! a maximum decimal-rounding error of approximately `0.5 * 10^-decimal_precision`, plus
-//! floating-point arithmetic slack.
+//! `decimal_precision` (1...4) is the number of decimal places Camel's bounded-decimal model
+//! preserves. Values within that precision round-trip exactly, aside from possible ULP-level
+//! slack from floating-point decomposition and recomposition; values that exceed it are rounded to
+//! `decimal_precision` places before encoding, with a maximum error of
+//! `0.5 * 10^-decimal_precision`. Callers requiring bitwise losslessness should use Chimp64 or
+//! Chimp128 instead.
 
 const std = @import("std");
 const math = std.math;
