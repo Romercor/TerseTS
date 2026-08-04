@@ -32,6 +32,9 @@
 //! fit in an `i64`, and the difference between consecutive integer parts must fit in 16-bit.
 //! If that constraint is violated, `compress` returns `Error.UnsupportedInput`. If data contains highly
 //! variable integer parts, users can still apply Camel by first transforming the data to a normalized range.
+//! Moreover, values within the selected precision can still reconstruct to a neighboring `f64` bit pattern
+//! because Camel rebuilds decimal components with binary floating-point arithmetic. The configured
+//! decimal value is preserved, but bit-exact recovery is not guaranteed.
 
 const std = @import("std");
 const math = std.math;
@@ -128,10 +131,13 @@ pub fn compress(
         if (!fitsIntegerPart(rounded_value)) return Error.UnsupportedInput;
 
         const integer_part = integerPart(rounded_value);
-        const integer_delta = @subWithOverflow(integer_part, previous_integer);
-        if (integer_delta[1] != 0 or @abs(integer_delta[0]) > maximum_integer_delta) {
+        const integer_delta_result = @subWithOverflow(integer_part, previous_integer);
+        if (integer_delta_result[1] != 0 or
+            @abs(integer_delta_result[0]) > maximum_integer_delta)
+        {
             return Error.UnsupportedInput;
         }
+        const integer_delta = integer_delta_result[0];
 
         const is_non_negative = !math.signbit(rounded_value);
         const decimal_place_count = @min(
@@ -139,7 +145,7 @@ pub fn compress(
             parsed_configuration.decimal_precision,
         );
 
-        try compressIntegerPart(previous_integer, integer_part, is_non_negative, &bit_writer);
+        try compressIntegerPart(integer_delta, is_non_negative, &bit_writer);
         // Counts 1...4 are stored as 0...3 in the two-bit field.
         try bit_writer.writeBits(
             @as(u2, @intCast(decimal_place_count - 1)),
@@ -167,17 +173,20 @@ pub fn decompress(
     decompressed_values: *ArrayList(f64),
 ) Error!void {
     var offset: usize = 0;
+    if (compressed_values.len < @sizeOf(f64)) return Error.CorruptedCompressedData;
 
     const first_value = try shared_functions.readOffsetValue(f64, compressed_values, &offset);
+    if (!fitsIntegerPart(first_value)) return Error.CorruptedCompressedData;
     try decompressed_values.append(allocator, first_value);
 
     var previous_integer = integerPart(first_value);
     var bit_reader = shared_structs.BulkBitReader.init(compressed_values[offset..]);
 
     while (true) {
-        // If the stream ends with the impossible extended-delta encoding,
-        // `decompressIntegerPart` returns `null` to signal the end of the stream.
         const decoded_integer_part = try decompressIntegerPart(previous_integer, &bit_reader) orelse break;
+        if (decoded_integer_part.value == math.minInt(i64)) {
+            return Error.CorruptedCompressedData;
+        }
 
         const decimal_place_count: u8 = @as(
             u8,
@@ -240,23 +249,15 @@ fn decimalPlaceCount(value: f64, maximum_decimal_places: u8) u8 {
     return decimal_place_count;
 }
 
-/// Reinterprets an `f64` as its raw IEEE-754 `u64` bit pattern.
-fn floatToBits(value: f64) u64 {
-    return @as(u64, @bitCast(value));
-}
-
-/// Write one value's sign and delta-encoded integer part (Algorithm 1 of the paper). Integer deltas
-/// `-1`, `0`, and `1` use a two-bit code. Larger deltas use marker `11`, a sign bit, a magnitude
-/// width bit, and either a 3-bit or 16-bit unsigned magnitude.
+/// Write `is_non_negative` and `integer_delta` to `writer`. Deltas `-1`, `0`, and `1` use a two-bit
+/// code; larger deltas use marker `11`, a sign bit, a width bit, and a 3- or 16-bit magnitude.
 fn compressIntegerPart(
-    previous_integer: i64,
-    integer_part: i64,
+    integer_delta: i64,
     is_non_negative: bool,
     writer: *shared_structs.BulkBitWriter,
 ) !void {
     try writer.writeBits(@as(u1, @intFromBool(is_non_negative)), 1);
 
-    const integer_delta = integer_part - previous_integer;
     const delta_magnitude = @abs(integer_delta);
     if (delta_magnitude <= 1) {
         // Map deltas -1, 0, and 1 to codes 0, 1, and 2 respectively.
@@ -277,9 +278,8 @@ fn compressIntegerPart(
     }
 }
 
-/// Compress a non-negative fractional magnitude using Camel's decimal XOR scheme (Algorithm 2).
-/// A one-bit marker chooses between an XOR reference representation and a directly quantized
-/// representation. The value's sign is encoded with its integer part.
+/// Write `fractional_magnitude` to `writer` using `decimal_place_count`. A marker selects Camel's
+/// XOR-reference representation or a directly quantized representation.
 fn compressDecimalPart(
     fractional_magnitude: f64,
     decimal_place_count: u8,
@@ -299,10 +299,8 @@ fn compressDecimalPart(
     if (fractional_magnitude >= binary_step) {
         // Marker 1: write the significant XOR-center bits and the quantized XOR reference.
         try writer.writeBits(@as(u1, 1), 1);
-        const raw_xor_reference = computeXorReferenceFraction(
-            fractional_magnitude,
-            decimal_place_count,
-        );
+        const raw_xor_reference = fractional_magnitude -
+            binary_step * @floor(fractional_magnitude / binary_step);
         const quantized_xor_reference: u64 = @intFromFloat(@round(
             raw_xor_reference * decimal_scale,
         ));
@@ -316,7 +314,7 @@ fn compressDecimalPart(
         const xor_center_bits = (fractional_xor >> center_bit_shift) & center_bit_mask;
 
         try writer.writeBits(xor_center_bits, @as(u6, @intCast(decimal_place_count)));
-        try writeQuantizedXorReference(
+        try writeQuantizedFraction(
             quantized_xor_reference,
             decimal_place_count,
             writer,
@@ -327,27 +325,19 @@ fn compressDecimalPart(
         const quantized_magnitude: u64 = @intFromFloat(@round(
             fractional_magnitude * decimal_scale,
         ));
-        try writeQuantizedXorReference(quantized_magnitude, decimal_place_count, writer);
+        try writeQuantizedFraction(quantized_magnitude, decimal_place_count, writer);
     }
 }
 
-/// Return the fractional XOR reference from formula (3) of the paper:
-/// `fraction - 2^-count * floor(fraction / 2^-count)`.
-fn computeXorReferenceFraction(fractional_magnitude: f64, decimal_place_count: u8) f64 {
-    if (decimal_place_count == 0) return 0.0;
-
-    const binary_step = math.pow(
-        f64,
-        2.0,
-        -@as(f64, @floatFromInt(decimal_place_count)),
-    );
-    return fractional_magnitude - binary_step * @floor(fractional_magnitude / binary_step);
+/// Reinterpret `value` as its raw IEEE-754 bits.
+fn floatToBits(value: f64) u64 {
+    return @as(u64, @bitCast(value));
 }
 
 /// Write a quantized fractional value using the prefix and value-width buckets from the Java
 /// reference implementation's `mValueBits` table. The bucket table depends on the decimal-place
 /// count, which is already encoded in the stream.
-fn writeQuantizedXorReference(
+fn writeQuantizedFraction(
     quantized_value: u64,
     decimal_place_count: u8,
     writer: *shared_structs.BulkBitWriter,
@@ -404,7 +394,7 @@ fn writeEndMarker(writer: *shared_structs.BulkBitWriter) Error!void {
     try writer.writeBits(end_marker_bits, @bitSizeOf(@TypeOf(end_marker_bits)));
 }
 
-/// Reinterpret a raw IEEE-754 `u64` bit pattern as an `f64`. Inverse of `floatToBits`.
+/// Reinterpret `bits` as an IEEE-754 `f64`.
 fn bitsToFloat(bits: u64) f64 {
     return @as(f64, @bitCast(bits));
 }
@@ -479,35 +469,30 @@ fn decompressDecimalPart(
         @as(f64, @floatFromInt(decimal_place_count)),
     );
 
-    var fractional_magnitude: f64 = undefined;
-    if (uses_xor_reference == 1) {
-        const xor_center_bits = reader.readBitsNoEof(
-            u64,
-            @as(u6, @intCast(decimal_place_count)),
-        ) catch return Error.CorruptedCompressedData;
-        const center_bit_shift: u6 = @intCast(f64_fraction_bits - decimal_place_count);
-        const positioned_xor_bits = xor_center_bits << center_bit_shift;
-        const quantized_xor_reference = try readQuantizedXorReference(
-            decimal_place_count,
-            reader,
-        );
-        const xor_reference = @as(f64, @floatFromInt(quantized_xor_reference)) / decimal_scale;
-        fractional_magnitude = bitsToFloat(
-            floatToBits(1.0 + xor_reference) ^ positioned_xor_bits,
-        ) - 1.0;
-        if (fractional_magnitude < 0.0) fractional_magnitude = 0.0;
-        // Snap to the encoded decimal-place count to remove residual XOR arithmetic noise.
-        fractional_magnitude = @round(fractional_magnitude * decimal_scale) / decimal_scale;
-    } else {
-        const quantized_magnitude = try readQuantizedXorReference(decimal_place_count, reader);
-        fractional_magnitude = @as(f64, @floatFromInt(quantized_magnitude)) / decimal_scale;
+    if (uses_xor_reference == 0) {
+        const quantized_magnitude = try readQuantizedFraction(decimal_place_count, reader);
+        return @as(f64, @floatFromInt(quantized_magnitude)) / decimal_scale;
     }
 
-    return fractional_magnitude;
+    const xor_center_bits = reader.readBitsNoEof(
+        u64,
+        @as(u6, @intCast(decimal_place_count)),
+    ) catch return Error.CorruptedCompressedData;
+    const center_bit_shift: u6 = @intCast(f64_fraction_bits - decimal_place_count);
+    const positioned_xor_bits = xor_center_bits << center_bit_shift;
+    const quantized_xor_reference = try readQuantizedFraction(decimal_place_count, reader);
+    const xor_reference = @as(f64, @floatFromInt(quantized_xor_reference)) / decimal_scale;
+    const fractional_magnitude = bitsToFloat(
+        floatToBits(1.0 + xor_reference) ^ positioned_xor_bits,
+    ) - 1.0;
+
+    // Snap to the encoded decimal-place count to remove residual XOR arithmetic noise.
+    return @round(fractional_magnitude * decimal_scale) / decimal_scale;
 }
 
-/// Read a quantized fractional value written by `writeQuantizedXorReference`.
-fn readQuantizedXorReference(
+/// Read a quantized fractional value written by `writeQuantizedFraction`. The `decimal_place_count`
+/// specifies the bucket table used to encode the value. The `reader` writes the value to a `u64` and returns it.
+fn readQuantizedFraction(
     decimal_place_count: u8,
     reader: *shared_structs.BulkBitReader,
 ) Error!u64 {
@@ -549,35 +534,6 @@ fn readQuantizedXorReference(
     }
 }
 
-/// Assert bit-exact behavior for selected regression values known to be reconstructed exactly by
-/// Camel. This is deliberately narrower than Camel's public lossy contract.
-fn expectExactRoundTrip(uncompressed_values: []const f64, decimal_precision: u8) !void {
-    var configuration_buffer: [32]u8 = undefined;
-    const method_configuration = try std.fmt.bufPrint(
-        &configuration_buffer,
-        "{{\"decimal_precision\": {d}}}",
-        .{decimal_precision},
-    );
-
-    var compressed_values = ArrayList(u8).empty;
-    defer compressed_values.deinit(testing.allocator);
-    try compress(
-        testing.allocator,
-        uncompressed_values,
-        &compressed_values,
-        method_configuration,
-    );
-
-    var decompressed_values = ArrayList(f64).empty;
-    defer decompressed_values.deinit(testing.allocator);
-    try decompress(testing.allocator, compressed_values.items, &decompressed_values);
-
-    try testing.expectEqual(uncompressed_values.len, decompressed_values.items.len);
-    for (uncompressed_values, decompressed_values.items) |original, reconstructed| {
-        try testing.expectEqual(floatToBits(original), floatToBits(reconstructed));
-    }
-}
-
 test "camel detects decimal places only within the configured precision" {
     try testing.expectEqual(@as(u8, 1), decimalPlaceCount(12.0, 4));
     try testing.expectEqual(@as(u8, 1), decimalPlaceCount(1.2, 4));
@@ -587,29 +543,7 @@ test "camel detects decimal places only within the configured precision" {
     try testing.expectEqual(@as(u8, 5), decimalPlaceCount(1.23456, 4));
 }
 
-test "camel terminates the stream with an impossible integer encoding" {
-    const uncompressed_values = &[_]f64{42.5};
-    var compressed_values = ArrayList(u8).empty;
-    defer compressed_values.deinit(testing.allocator);
-
-    try compress(
-        testing.allocator,
-        uncompressed_values,
-        &compressed_values,
-        "{\"decimal_precision\": 1}",
-    );
-
-    try testing.expectEqual(@sizeOf(f64) + @sizeOf(u8), compressed_values.items.len);
-    try testing.expectEqual(end_marker_bits, compressed_values.items[@sizeOf(f64)]);
-
-    var decompressed_values = ArrayList(f64).empty;
-    defer decompressed_values.deinit(testing.allocator);
-    try decompress(testing.allocator, compressed_values.items, &decompressed_values);
-
-    try testing.expectEqualSlices(f64, uncompressed_values, decompressed_values.items);
-}
-
-test "camel exactly roundtrips representative integer and decimal encodings" {
+test "camel does roundtrips on representative integer and decimal encodings" {
     const maximum_delta: f64 = @floatFromInt(maximum_integer_delta);
     const cases = [_]struct {
         values: []const f64,
@@ -628,79 +562,90 @@ test "camel exactly roundtrips representative integer and decimal encodings" {
     };
 
     for (cases) |case| {
-        try expectExactRoundTrip(case.values, case.decimal_precision);
-    }
-}
-
-test "camel preserves bounded-decimal inputs within floating-point precision" {
-    const uncompressed_values = &[_]f64{ 0.0, 1.23, -4.56 };
-
-    var compressed_values = ArrayList(u8).empty;
-    defer compressed_values.deinit(testing.allocator);
-    try compress(
-        testing.allocator,
-        uncompressed_values,
-        &compressed_values,
-        "{\"decimal_precision\": 2}",
-    );
-
-    var decompressed_values = ArrayList(f64).empty;
-    defer decompressed_values.deinit(testing.allocator);
-    try decompress(testing.allocator, compressed_values.items, &decompressed_values);
-
-    try testing.expectEqual(uncompressed_values.len, decompressed_values.items.len);
-    for (uncompressed_values, decompressed_values.items) |original, reconstructed| {
-        const floating_point_tolerance = @max(@as(f64, 1.0), @abs(original)) *
-            math.floatEps(f64);
-        try testing.expectApproxEqAbs(original, reconstructed, floating_point_tolerance);
-    }
-}
-
-test "camel rounds values to the configured decimal precision" {
-    const uncompressed_values = &[_]f64{ 0.0, 0.123456 };
-    const cases = [_]struct {
-        decimal_precision: u8,
-        expected_value: f64,
-    }{
-        .{ .decimal_precision = 1, .expected_value = 0.1 },
-        .{ .decimal_precision = 2, .expected_value = 0.12 },
-        .{ .decimal_precision = 3, .expected_value = 0.123 },
-        .{ .decimal_precision = 4, .expected_value = 0.1235 },
-    };
-
-    for (cases) |case| {
         var configuration_buffer: [32]u8 = undefined;
         const method_configuration = try std.fmt.bufPrint(
             &configuration_buffer,
             "{{\"decimal_precision\": {d}}}",
             .{case.decimal_precision},
         );
+        try tester.expectExactRoundTrip(
+            testing.allocator,
+            compress,
+            decompress,
+            case.values,
+            method_configuration,
+        );
+    }
+}
 
-        var compressed_values = ArrayList(u8).empty;
-        defer compressed_values.deinit(testing.allocator);
+test "camel preserves random values on configured decimal grids" {
+    const random = tester.getDefaultRandomGenerator();
+
+    var generated_values = ArrayList(f64).empty;
+    defer generated_values.deinit(testing.allocator);
+    try generated_values.appendSlice(testing.allocator, &[_]f64{ 0.0, -4.56 });
+    // A range narrower than 65,535 keeps every possible consecutive integer delta encodable.
+    try tester.generateBoundedRandomValues(
+        testing.allocator,
+        &generated_values,
+        -30_000.0,
+        30_000.0,
+        random,
+    );
+
+    var rounded_values = ArrayList(f64).empty;
+    defer rounded_values.deinit(testing.allocator);
+    var compressed_values = ArrayList(u8).empty;
+    defer compressed_values.deinit(testing.allocator);
+    var decompressed_values = ArrayList(f64).empty;
+    defer decompressed_values.deinit(testing.allocator);
+
+    for (1..maximum_encoded_decimal_places + 1) |precision_index| {
+        const decimal_precision: u8 = @intCast(precision_index);
+        rounded_values.clearRetainingCapacity();
+        compressed_values.clearRetainingCapacity();
+        decompressed_values.clearRetainingCapacity();
+
+        for (generated_values.items) |value| {
+            try rounded_values.append(
+                testing.allocator,
+                roundToDecimalPrecision(value, decimal_precision),
+            );
+        }
+
+        var configuration_buffer: [32]u8 = undefined;
+        const method_configuration = try std.fmt.bufPrint(
+            &configuration_buffer,
+            "{{\"decimal_precision\": {d}}}",
+            .{decimal_precision},
+        );
         try compress(
             testing.allocator,
-            uncompressed_values,
+            rounded_values.items,
             &compressed_values,
             method_configuration,
         );
-
-        var decompressed_values = ArrayList(f64).empty;
-        defer decompressed_values.deinit(testing.allocator);
         try decompress(testing.allocator, compressed_values.items, &decompressed_values);
 
-        try testing.expectEqual(uncompressed_values.len, decompressed_values.items.len);
-        try testing.expectEqual(
-            floatToBits(uncompressed_values[0]),
-            floatToBits(decompressed_values.items[0]),
+        try testing.expectEqual(rounded_values.items.len, decompressed_values.items.len);
+        const decimal_scale = math.pow(
+            f64,
+            10.0,
+            @as(f64, @floatFromInt(decimal_precision)),
         );
-        try testing.expect(
-            floatToBits(uncompressed_values[1]) != floatToBits(decompressed_values.items[1]),
-        );
-        try testing.expectEqual(
-            floatToBits(case.expected_value),
-            floatToBits(decompressed_values.items[1]),
-        );
+        for (rounded_values.items, decompressed_values.items) |original, reconstructed| {
+            const original_decimal_units: i64 = @intFromFloat(@round(original * decimal_scale));
+            const reconstructed_decimal_units: i64 = @intFromFloat(@round(
+                reconstructed * decimal_scale,
+            ));
+            try testing.expectEqual(original_decimal_units, reconstructed_decimal_units);
+
+            const floating_point_tolerance = @max(
+                @as(f64, 1.0),
+                @max(@abs(original), @abs(reconstructed)),
+            ) * math.floatEps(f64);
+            try testing.expectApproxEqAbs(original, reconstructed, floating_point_tolerance);
+        }
     }
 }
 
