@@ -359,6 +359,7 @@ pub fn compress(
                 &compressed_values,
                 configuration,
             );
+        },
         .ElfPlus => {
             try elf_plus.compress(
                 allocator,
@@ -482,6 +483,7 @@ pub fn decompress(
         },
         .Camel => {
             try camel.decompress(allocator, compressed_values_slice, &decompressed_values);
+        },
         .ElfPlus => {
             try elf_plus.decompress(allocator, compressed_values_slice, &decompressed_values);
         },
@@ -867,8 +869,7 @@ test "extract and rebuild works for any compression method supported" {
             method == Method.MacaqueS or
             method == Method.MacaqueV or
             method == Method.Elf or
-            method == Method.Camel)
-            method == Method.MacaqueV or
+            method == Method.Camel or
             method == Method.ElfPlus)
         {
             // These compression methods are not supported for extraction
