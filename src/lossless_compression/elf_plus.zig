@@ -47,8 +47,7 @@ const tester = @import("../tester.zig");
 const Error = tersets.Error;
 const Method = tersets.Method;
 
-// Terms below follow the Elf paper (Theorem 3). Defined once here, so the per-item
-// comments can stay short:
+// Terms from the Elf paper (Theorem 3), defined once so later comments can stay short:
 //   alpha                - decimal digits after the point.
 //   beta                 - count of significant decimal digits.
 //   beta_star            - beta stored per value in 4 bits; 0 is a sentinel for the
@@ -58,8 +57,6 @@ const Method = tersets.Method;
 //   f(alpha)             - binary bits needed for alpha decimal digits = ceil(alpha*log2(10)).
 //   g(alpha)             - mantissa cut point = f(alpha) + exponent - 1023.
 
-/// Number of bits in an IEEE-754 `f64`; the width of every value Elf+ XOR-encodes.
-const bits_per_value: u16 = 64;
 /// IEEE-754 `f64` layout used by the eraser: 52 mantissa bits and an exponent biased by 1023.
 const mantissa_bits: u6 = 52;
 const exponent_bias: i32 = 1023;
@@ -67,41 +64,35 @@ const exponent_mask: u64 = 0x7ff;
 /// Number of randomized rounds the generated-distribution round-trip test runs.
 const generated_test_rounds: usize = 5;
 
-/// Precision ceiling of an `f64`: about 15.95 decimal digits, at most 17 to round-trip any value exactly.
-/// beta computation returns 17 to signal the value has no short exact decimal form, so the eraser leaves it unchanged.
+/// Digits needed to round-trip any `f64`. beta returns this to mean "no short exact decimal
+/// form", which routes the value to no-erase.
 const maximum_significant_digits: u8 = 17;
 
-/// Cap on how many extra powers of ten the beta computation tries.
-/// Past this many, the value is treated as having no short exact decimal form.
-/// Beyond an `f64`'s ~15.95 digits of precision, more iterations only chase floating-point noise.
+/// Cap on the `getSignificantCount` search. An `f64` carries ~16 significant digits, so beyond
+/// this many steps the multiply is only chasing rounding noise.
 const maximum_scale_iterations: u8 = 22;
 
-/// Strict upper bound for a value that can be safely truncated into an
-/// `i64` via `@intFromFloat` (2^63, exactly representable as `f64`).
+/// Smallest value that `@intFromFloat` cannot truncate into an `i64`.
 const maximum_safe_int_float: f64 = 0x1p63;
 
-/// Number of binary bits needed to represent 10^alpha exactly, for alpha in [0, 20]. The `eraser`
-/// uses this to locate the mantissa cut point: bits below position `f_alpha_table[alpha] + e - 1023`
-/// (e = biased exponent) are noise it can erase while still restoring the value from the stored
-/// digit count. Defined as `f_alpha_table[alpha] = ceil(alpha * log2(10))`.
+/// f(alpha) = ceil(alpha * log2(10)) for alpha in [0, 20]: the binary bits needed to hold alpha
+/// decimal digits. The `eraser` reads it to find the mantissa cut point.
 const f_alpha_table = [_]u8{
     0,  4,  7,  10, 14, 17, 20, 24, 27, 30,
     34, 37, 40, 44, 47, 50, 54, 57, 60, 64,
     67,
 };
 
-/// 10^i for i in [0, 20]. Used when computing beta: the significant-digit search multiplies the
-/// value by successive powers of ten (value * 10^i) until the product is an exact integer.
-/// Defined as `power_of_10_table[i] = 10^i`.
+/// 10^i for i in [0, 20]. The significant-digit search scales by these until the product is an
+/// exact integer.
 const power_of_10_table = [_]f64{
     1.0,    1.0e1,  1.0e2,  1.0e3,  1.0e4,  1.0e5,  1.0e6,
     1.0e7,  1.0e8,  1.0e9,  1.0e10, 1.0e11, 1.0e12, 1.0e13,
     1.0e14, 1.0e15, 1.0e16, 1.0e17, 1.0e18, 1.0e19, 1.0e20,
 };
 
-/// 10^-i for i in [0, 20]. Used by `restorer` for the corner case where the original value was an
-/// exact negative power of ten: restoring reduces to a direct lookup here
-/// instead of the usual rounding. Defined as `negative_power_of_10_table[i] = 10^-i`.
+/// 10^-i for i in [0, 20]. `restorer` looks the value up here when the original was an exact
+/// negative power of ten.
 const negative_power_of_10_table = [_]f64{
     1.0,     1.0e-1,  1.0e-2,  1.0e-3,  1.0e-4,  1.0e-5,  1.0e-6,
     1.0e-7,  1.0e-8,  1.0e-9,  1.0e-10, 1.0e-11, 1.0e-12, 1.0e-13,
@@ -123,51 +114,8 @@ const sp_table_lt_one = [_]f64{
     1.0e-6, 1.0e-7, 1.0e-8, 1.0e-9, 1.0e-10,
 };
 
-/// Chimp-style leading-zero buckets, also used by Elf+'s `xorCompress` (shared with Chimp64/128).
-const leading_zero_bucket_values = [_]u6{ 0, 8, 12, 16, 18, 20, 22, 24 };
-
-/// Maps an exact leading-zero count (0..63, as returned by @clz on the XOR) to the index of the
-/// largest bucket in leading_zero_bucket_values that does not exceed it. A 64-entry lookup that
-/// replaces Chimp64's linear-search `leadingZeroBucketIndex` function.
-const leading_zero_bucket_index = [_]u3{
-    0, 0, 0, 0, 0, 0, 0, 0, // 0..7  -> bucket 0  (value 0).
-    1, 1, 1, 1, // 8..11   -> bucket 1  (value 8).
-    2, 2, 2, 2, // 12..15  -> bucket 2  (value 12).
-    3, 3, // 16..17  -> bucket 3  (value 16).
-    4, 4, // 18..19  -> bucket 4  (value 18).
-    5, 5, // 20..21  -> bucket 5  (value 20).
-    6, 6, // 22..23  -> bucket 6  (value 22).
-    7, 7, 7, 7, 7, 7, 7, 7, // 24..31  -> bucket 7  (value 24).
-    7, 7, 7, 7, 7, 7, 7, 7, // 32..39  -> bucket 7.
-    7, 7, 7, 7, 7, 7, 7, 7, // 40..47  -> bucket 7.
-    7, 7, 7, 7, 7, 7, 7, 7, // 48..55  -> bucket 7.
-    7, 7, 7, 7, 7, 7, 7, 7, // 56..63  -> bucket 7.
-};
-
-/// Maps an exact leading-zero count to the rounded-down bucket value
-/// (leading_zero_bucket_values[leading_zero_bucket_index[exact_leading_zeros]]). Used to update
-/// the encoder's stored_leading_zeros after a new-bucket case, and to compare against the
-/// previous value's stored_leading_zeros for the bucket-reuse decision.
-const leading_zero_rounded = [_]u6{
-    0, 0, 0, 0, 0, 0, 0, 0, // 0..7   -> 0.
-    8, 8, 8, 8, // 8..11  -> 8.
-    12, 12, 12, 12, // 12..15 -> 12.
-    16, 16, // 16..17 -> 16.
-    18, 18, // 18..19 -> 18.
-    20, 20, // 20..21 -> 20.
-    22, 22, // 22..23 -> 22.
-    24, 24, 24, 24, 24, 24, 24, 24, // 24..31 -> 24.
-    24, 24, 24, 24, 24, 24, 24, 24, // 32..39 -> 24.
-    24, 24, 24, 24, 24, 24, 24, 24, // 40..47 -> 24.
-    24, 24, 24, 24, 24, 24, 24, 24, // 48..55 -> 24.
-    24, 24, 24, 24, 24, 24, 24, 24, // 56..63 -> 24.
-};
-
-/// State the `xorCompress` encoder and `xorDecompress` decoder carry from one value to the next.
-/// stored_value_prime holds the previous value_prime as raw u64 bits.
-/// stored_leading_zeros and stored_trailing_zeros hold the previous bucket.
-/// They decide whether to reuse that bucket (case 00) or write a new one (cases 10/11).
-/// The bucket fields are null until the first bucket is written, so the first value never reuses a bucket.
+/// State carried from one value to the next by `xorCompress` and `xorDecompress`. The bucket
+/// fields are null until a bucket is written, so the first value can never reuse one.
 const XorState = struct {
     stored_value_prime: u64,
     stored_leading_zeros: ?u6,
@@ -292,7 +240,7 @@ pub fn decompress(
     }
 }
 
-/// Returns the significand position of `value_abs` together with `is_negative_power_of_ten`, a flag
+/// Return the significand position of `value_abs` together with `is_negative_power_of_ten`, a flag
 /// set only when `value_abs` is exactly 10^-i for some i > 0. That is the corner case where erasing
 /// would not preserve the significand position (paper Theorem 3), so `computeAlphaAndBetaStar`
 /// handles it separately.
@@ -327,7 +275,7 @@ fn significandPosition(value_abs: f64) struct { position: i16, is_negative_power
     };
 }
 
-/// Returns f(alpha) = ceil(alpha * log2(10)), the number of binary mantissa bits needed to hold
+/// Return f(alpha) = ceil(alpha * log2(10)), the number of binary mantissa bits needed to hold
 /// alpha decimal digits (alpha = digits after the decimal point). The `eraser` uses it as
 /// g(alpha) = getFAlpha(alpha) + exponent - 1023 to locate the mantissa cut point.
 fn getFAlpha(alpha: i32) i32 {
@@ -339,25 +287,25 @@ fn getFAlpha(alpha: i32) i32 {
     return @as(i32, f_alpha_table[@intCast(alpha)]);
 }
 
-/// Returns 10^i. Used by the beta-computation loop to walk value * 10^i until it becomes
+/// Return 10^i. Used by the beta-computation loop to walk value * 10^i until it becomes
 /// an exact integer, and by `roundUp` during decompression.
 fn getPositivePowerOfTen(i: i32) f64 {
     if (i >= power_of_10_table.len) {
-        return std.math.pow(f64, 10.0, @floatFromInt(i));
+        return math.pow(f64, 10.0, @floatFromInt(i));
     }
     return power_of_10_table[@intCast(i)];
 }
 
-/// Returns 10^-i. Used by `restorer` for the exact-negative-power-of-ten corner case:
+/// Return 10^-i. Used by `restorer` for the exact-negative-power-of-ten corner case:
 /// restoring reduces to value = 10^-(significand_position+1), looked up directly here.
 fn getNegativePowerOfTen(i: i32) f64 {
     if (i >= negative_power_of_10_table.len) {
-        return std.math.pow(f64, 10.0, -@as(f64, @floatFromInt(i)));
+        return math.pow(f64, 10.0, -@as(f64, @floatFromInt(i)));
     }
     return negative_power_of_10_table[@intCast(i)];
 }
 
-/// Returns the count of significant decimal digits needed to represent `value_abs` exactly.
+/// Return the count of significant decimal digits needed to represent `value_abs` exactly.
 /// The leading digit sits at `significand_position`. Returns 17 when `value_abs` has no short
 /// exact decimal form, or needs more digits than an `f64` can distinguish.
 /// `last_beta_star` seeds the starting exponent so consecutive same-precision values skip early iterations.
@@ -415,7 +363,7 @@ fn getSignificantCount(value_abs: f64, significand_position: i16, last_beta_star
     return @intCast(@max(0, @min(significant_count, @as(i32, maximum_significant_digits))));
 }
 
-/// Returns the two quantities `eraser` needs: `alpha`, the number of decimal digits after the point,
+/// Return the two quantities `eraser` needs: `alpha`, the number of decimal digits after the point,
 /// and `beta_star`, the significant-digit count stored per value (4 bits) that `restorer` uses to
 /// round value_prime back to the original. `beta_star` is the significant-digit count normally; the
 /// value 0 is reserved as a sentinel for the exact-negative-power-of-ten corner case
@@ -430,7 +378,7 @@ fn computeAlphaAndBetaStar(value_abs: f64, last_beta_star: ?u8) struct { alpha: 
     return .{ .alpha = alpha, .beta_star = beta_star };
 }
 
-/// Returns `value` rounded to exactly `alpha` decimal places, away from zero. Used by `restorer`
+/// Return `value` rounded to exactly `alpha` decimal places, away from zero. Used by `restorer`
 /// to recover the original value from an erased one.
 fn roundUp(value: f64, alpha: i32) f64 {
     const scale = getPositivePowerOfTen(alpha);
@@ -456,7 +404,7 @@ fn eraser(
 
     // Special values: 0, +/-inf, NaN. Skip the decimal-precision machinery and pass
     // raw bits through `xorCompress`. last_beta_star is preserved so the next decimal value can still reuse it.
-    if (value == 0.0 or std.math.isInf(value) or std.math.isNan(value)) {
+    if (value == 0.0 or math.isInf(value) or math.isNan(value)) {
         try bit_writer.writeBits(@as(u2, 0b10), 2);
         return .{ .value_prime_bits = value_bits, .new_last_beta_star = last_beta_star };
     }
@@ -464,7 +412,7 @@ fn eraser(
     // Decimal-precision analysis. beta_star will be written to the stream; alpha is used to
     // compute how many mantissa bits to erase.
     const value_abs = @abs(value);
-    const ab = computeAlphaAndBetaStar(value_abs, last_beta_star);
+    const alpha_beta_star = computeAlphaAndBetaStar(value_abs, last_beta_star);
 
     // Bail to no-erase if alpha is outside the useful range. Normally alpha equals the scale i
     // (>= 1), so these guards only catch the extremes where the significant-digit search saturated:
@@ -472,12 +420,12 @@ fn eraser(
     //   alpha >= 21 -> beyond the f_alpha_table (very small / subnormal values) - rare, skip.
     // Ordinary integers (e.g. 100.0) pass this guard with alpha >= 0; they route to no-erase a few
     // lines below via the delta == 0 check, which sees no erasable low mantissa bits.
-    if (ab.alpha < 0 or ab.alpha >= f_alpha_table.len) {
+    if (alpha_beta_star.alpha < 0 or alpha_beta_star.alpha >= f_alpha_table.len) {
         try bit_writer.writeBits(@as(u2, 0b10), 2);
         return .{ .value_prime_bits = value_bits, .new_last_beta_star = last_beta_star };
     }
     // beta_star is encoded in 4 bits; values > 15 are not representable on the erase path.
-    if (ab.beta_star > 15) {
+    if (alpha_beta_star.beta_star > 15) {
         try bit_writer.writeBits(@as(u2, 0b10), 2);
         return .{ .value_prime_bits = value_bits, .new_last_beta_star = last_beta_star };
     }
@@ -485,13 +433,13 @@ fn eraser(
     // g(alpha) tells us how many mantissa bits are needed to represent the value exactly given
     // its decimal precision; everything below g(alpha) is binary noise we can erase.
     const exponent: i32 = @intCast((value_bits >> mantissa_bits) & exponent_mask);
-    const g_alpha: i32 = getFAlpha(ab.alpha) + exponent - exponent_bias;
+    const g_alpha: i32 = getFAlpha(alpha_beta_star.alpha) + exponent - exponent_bias;
     const erase_bits: i32 = @as(i32, mantissa_bits) - g_alpha;
 
     // Profitability + safety guard:
     //   <= 4 bits saved -> the erase marker + beta_star overhead wipes the gain.
     //   >= 64 bits     -> shift count would be UB on u64.
-    if (erase_bits <= 4 or erase_bits >= bits_per_value) {
+    if (erase_bits <= 4 or erase_bits >= shared_structs.bits_per_value) {
         try bit_writer.writeBits(@as(u2, 0b10), 2);
         return .{ .value_prime_bits = value_bits, .new_last_beta_star = last_beta_star };
     }
@@ -510,16 +458,16 @@ fn eraser(
 
     // beta_star reuse: if it matches the previous erased value's beta_star, emit the 1-bit
     // case-0 marker instead of re-writing the 6-bit case-11 marker.
-    if (last_beta_star) |lbs| {
-        if (lbs == ab.beta_star) {
+    if (last_beta_star) |previous_beta_star| {
+        if (previous_beta_star == alpha_beta_star.beta_star) {
             try bit_writer.writeBits(@as(u1, 0), 1);
             return .{ .value_prime_bits = value_prime_bits, .new_last_beta_star = last_beta_star };
         }
     }
 
     try bit_writer.writeBits(@as(u2, 0b11), 2);
-    try bit_writer.writeBits(ab.beta_star, 4);
-    return .{ .value_prime_bits = value_prime_bits, .new_last_beta_star = ab.beta_star };
+    try bit_writer.writeBits(alpha_beta_star.beta_star, 4);
+    return .{ .value_prime_bits = value_prime_bits, .new_last_beta_star = alpha_beta_star.beta_star };
 }
 
 /// Implements the paper's Restorer (inverse of `eraser`). Given an erased `value_prime` (from
@@ -529,18 +477,18 @@ fn eraser(
 fn restorer(value_prime: f64, beta_star: u8) Error!f64 {
     // The erase path is only valid for finite, non-zero values. A corrupted stream can
     // reconstruct 0/+-inf/NaN here, which would trap `significandPosition`'s @intFromFloat fallback below.
-    if (!std.math.isFinite(value_prime) or value_prime == 0.0) return Error.UnsupportedInput;
+    if (!math.isFinite(value_prime) or value_prime == 0.0) return Error.UnsupportedInput;
 
     const significand_position = significandPosition(@abs(value_prime)).position;
     if (beta_star == 0) {
         // The 10^-i corner case: significand position of value_prime = that of value - 1
-        // (Theorem 3), so i = -significand_position - 1. A corrupted stream can pair beta_star = 0 with
-        // |value_prime| >= 1 (significand_position >= 0), making i negative; `getNegativePowerOfTen` would trap on
-        // the negative @intCast. Reject instead.
-        const i: i32 = -@as(i32, significand_position) - 1;
-        if (i < 0) return Error.UnsupportedInput;
-        const recovered = getNegativePowerOfTen(i);
-        return if (value_prime < 0) -recovered else recovered;
+        // (Theorem 3), so negative_exponent = -significand_position - 1. A corrupted stream can pair
+        // beta_star = 0 with |value_prime| >= 1 (significand_position >= 0), making it negative;
+        // `getNegativePowerOfTen` would trap on the negative @intCast. Reject instead.
+        const negative_exponent: i32 = -@as(i32, significand_position) - 1;
+        if (negative_exponent < 0) return Error.UnsupportedInput;
+        const restored_value = getNegativePowerOfTen(negative_exponent);
+        return if (value_prime < 0) -restored_value else restored_value;
     }
     // For valid streams alpha equals the encoder's alpha, which is in [0, 20]. A corrupted
     // stream can drive alpha outside that range; reject it instead of calling pow() with a huge exponent.
@@ -556,26 +504,25 @@ fn xorCompress(
     value_prime_bits: u64,
     state: *XorState,
 ) Error!void {
-    const xor = state.stored_value_prime ^ value_prime_bits;
+    const xor_value = state.stored_value_prime ^ value_prime_bits;
 
-    // Case 01 (2 bits): identical value. Nothing else to write.
-    if (xor == 0) {
+    // Case 01: identical value.
+    if (xor_value == 0) {
         try bit_writer.writeBits(@as(u2, 0b01), 2);
         return;
     }
 
-    const exact_leading_zeros: u6 = @intCast(@clz(xor));
-    const exact_trailing_zeros: u6 = @intCast(@ctz(xor));
-    const new_leading_zeros = leading_zero_rounded[exact_leading_zeros];
+    const exact_leading_zeros: u6 = @intCast(@clz(xor_value));
+    const exact_trailing_zeros: u6 = @intCast(@ctz(xor_value));
+    const leading_bucket_index = shared_functions.leadingZeroBucketIndex(exact_leading_zeros);
+    const new_leading_zeros = shared_structs.leading_zero_buckets[leading_bucket_index];
 
-    // Case 00 (2 + center bits): bucket reuse. Triggers when the new XOR's lead matches
-    // the stored bucket AND has at least as many trailing zeros - meaning the meaningful
-    // bits fit inside the previously-defined window.
+    // Case 00: reuse the stored window, possible when the meaningful bits fit inside it.
     if (state.stored_leading_zeros) |bucket_leading_zeros| {
         if (state.stored_trailing_zeros) |bucket_trailing_zeros| {
             if (new_leading_zeros == bucket_leading_zeros and exact_trailing_zeros >= bucket_trailing_zeros) {
-                const center_bits: u16 = bits_per_value - @as(u16, bucket_leading_zeros) - @as(u16, bucket_trailing_zeros);
-                const meaningful: u64 = xor >> bucket_trailing_zeros;
+                const center_bits: u16 = shared_structs.bits_per_value - @as(u16, bucket_leading_zeros) - @as(u16, bucket_trailing_zeros);
+                const meaningful: u64 = xor_value >> bucket_trailing_zeros;
                 try bit_writer.writeBits(@as(u2, 0b00), 2);
                 try bit_writer.writeBits(meaningful, center_bits);
                 state.stored_value_prime = value_prime_bits;
@@ -584,27 +531,25 @@ fn xorCompress(
         }
     }
 
-    // Cases 10/11 (new bucket): write the bucket index plus the meaningful bits.
-    // The top meaningful bit is always 1 (otherwise leading_zeros would be larger),
-    // so encode (center_bits - 1) bits and let the decoder prepend the implicit 1.
-    const leading_bucket_index = leading_zero_bucket_index[exact_leading_zeros];
-    const center_bits: u16 = bits_per_value - @as(u16, new_leading_zeros) - @as(u16, exact_trailing_zeros);
+    // Cases 10/11: write a new bucket. The top meaningful bit is always 1, so only
+    // `center_bits - 1` bits are stored and the decoder prepends it.
+    const center_bits: u16 = shared_structs.bits_per_value - @as(u16, new_leading_zeros) - @as(u16, exact_trailing_zeros);
     const meaningful_bit_count: u16 = center_bits - 1;
-    // Two-step shift avoids `xor >> 64` UB when exact_trailing_zeros = 63 (center_bits = 1).
-    const meaningful: u64 = (xor >> exact_trailing_zeros) >> 1;
+    // Two-step shift avoids `xor_value >> 64` UB when exact_trailing_zeros = 63 (center_bits = 1).
+    const meaningful: u64 = (xor_value >> exact_trailing_zeros) >> 1;
 
     if (center_bits <= 16) {
         // Case 10 (2 + 3 + 4 + (center-1) bits): center count fits in 4 bits.
         // The mask & 0xf wraps `center_bits = 16` to 0; the decoder remaps 0 -> 16.
         try bit_writer.writeBits(@as(u2, 0b10), 2);
-        try bit_writer.writeBits(leading_bucket_index, 3);
+        try bit_writer.writeBits(leading_bucket_index, shared_structs.leading_zero_bucket_bits);
         try bit_writer.writeBits(@as(u4, @intCast(center_bits & 0xf)), 4);
         try bit_writer.writeBits(meaningful, meaningful_bit_count);
     } else {
         // Case 11 (2 + 3 + 6 + (center-1) bits): center count fits in 6 bits.
         // The mask & 0x3f wraps `center_bits = 64` to 0; the decoder remaps 0 -> 64.
         try bit_writer.writeBits(@as(u2, 0b11), 2);
-        try bit_writer.writeBits(leading_bucket_index, 3);
+        try bit_writer.writeBits(leading_bucket_index, shared_structs.leading_zero_bucket_bits);
         try bit_writer.writeBits(@as(u6, @intCast(center_bits & 0x3f)), 6);
         try bit_writer.writeBits(meaningful, meaningful_bit_count);
     }
@@ -630,30 +575,30 @@ fn xorDecompress(
         0b00 => {
             const bucket_leading_zeros = state.stored_leading_zeros orelse return Error.UnsupportedInput;
             const bucket_trailing_zeros = state.stored_trailing_zeros orelse return Error.UnsupportedInput;
-            const center_bits: u16 = bits_per_value - @as(u16, bucket_leading_zeros) - @as(u16, bucket_trailing_zeros);
+            const center_bits: u16 = shared_structs.bits_per_value - @as(u16, bucket_leading_zeros) - @as(u16, bucket_trailing_zeros);
             const meaningful = bit_reader.readBitsNoEof(u64, center_bits) catch return Error.ByteStreamError;
             // The encoder routes xor == 0 through case 01, never case 00, so meaningful is
             // always non-zero here. Reject a corrupted stream that encodes a zero-XOR reuse
             // instead of silently repeating the previous value.
             if (meaningful == 0) return Error.UnsupportedInput;
-            const xor = meaningful << bucket_trailing_zeros;
-            const value_prime_bits = state.stored_value_prime ^ xor;
+            const xor_value = meaningful << bucket_trailing_zeros;
+            const value_prime_bits = state.stored_value_prime ^ xor_value;
             state.stored_value_prime = value_prime_bits;
             return value_prime_bits;
         },
 
         // Case 10: new bucket, center_bits <= 16.
         0b10 => {
-            const leading_bucket_index = bit_reader.readBitsNoEof(u3, 3) catch return Error.ByteStreamError;
+            const leading_bucket_index = bit_reader.readBitsNoEof(u3, shared_structs.leading_zero_bucket_bits) catch return Error.ByteStreamError;
             const center_raw = bit_reader.readBitsNoEof(u4, 4) catch return Error.ByteStreamError;
-            const new_leading_zeros = leading_zero_bucket_values[leading_bucket_index];
+            const new_leading_zeros = shared_structs.leading_zero_buckets[leading_bucket_index];
             // Encoder wrote `center_bits & 0xf`; the 0 sentinel decodes back to 16.
             const center_bits: u16 = if (center_raw == 0) 16 else @as(u16, center_raw);
-            const new_trailing_zeros: u6 = @intCast(bits_per_value - @as(u16, new_leading_zeros) - center_bits);
+            const new_trailing_zeros: u6 = @intCast(shared_structs.bits_per_value - @as(u16, new_leading_zeros) - center_bits);
             // Read center-1 meaningful bits; prepend the implicit top 1 and shift into place.
             const meaningful = bit_reader.readBitsNoEof(u64, center_bits - 1) catch return Error.ByteStreamError;
-            const xor = ((meaningful << 1) | 1) << new_trailing_zeros;
-            const value_prime_bits = state.stored_value_prime ^ xor;
+            const xor_value = ((meaningful << 1) | 1) << new_trailing_zeros;
+            const value_prime_bits = state.stored_value_prime ^ xor_value;
             state.stored_value_prime = value_prime_bits;
             state.stored_leading_zeros = new_leading_zeros;
             state.stored_trailing_zeros = new_trailing_zeros;
@@ -662,19 +607,19 @@ fn xorDecompress(
 
         // Case 11: new bucket, center_bits > 16.
         0b11 => {
-            const leading_bucket_index = bit_reader.readBitsNoEof(u3, 3) catch return Error.ByteStreamError;
+            const leading_bucket_index = bit_reader.readBitsNoEof(u3, shared_structs.leading_zero_bucket_bits) catch return Error.ByteStreamError;
             const center_raw = bit_reader.readBitsNoEof(u6, 6) catch return Error.ByteStreamError;
-            const new_leading_zeros = leading_zero_bucket_values[leading_bucket_index];
+            const new_leading_zeros = shared_structs.leading_zero_buckets[leading_bucket_index];
             // Encoder wrote `center_bits & 0x3f`; the 0 sentinel decodes back to 64.
             const center_bits: u16 = if (center_raw == 0) 64 else @as(u16, center_raw);
             // Validate geometry before casting: a corrupted stream can pair a large center_bits
             // with a non-zero leading bucket, underflowing the trailing-zero count. Reject it
             // instead of trapping in the @intCast below.
-            if (@as(u16, new_leading_zeros) + center_bits > bits_per_value) return Error.UnsupportedInput;
-            const new_trailing_zeros: u6 = @intCast(bits_per_value - @as(u16, new_leading_zeros) - center_bits);
+            if (@as(u16, new_leading_zeros) + center_bits > shared_structs.bits_per_value) return Error.UnsupportedInput;
+            const new_trailing_zeros: u6 = @intCast(shared_structs.bits_per_value - @as(u16, new_leading_zeros) - center_bits);
             const meaningful = bit_reader.readBitsNoEof(u64, center_bits - 1) catch return Error.ByteStreamError;
-            const xor = ((meaningful << 1) | 1) << new_trailing_zeros;
-            const value_prime_bits = state.stored_value_prime ^ xor;
+            const xor_value = ((meaningful << 1) | 1) << new_trailing_zeros;
+            const value_prime_bits = state.stored_value_prime ^ xor_value;
             state.stored_value_prime = value_prime_bits;
             state.stored_leading_zeros = new_leading_zeros;
             state.stored_trailing_zeros = new_trailing_zeros;
