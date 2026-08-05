@@ -34,7 +34,10 @@ enum Method {
   DiscreteFourierTransform      = 22,
   MacaqueS                      = 23,
   MacaqueV                      = 24,
-  ElfPlus                       = 25,
+  LargestTriangleThreeBuckets   = 25,
+  Elf                           = 26,
+  Camel                         = 27,
+  ElfPlus                        = 28,
 };
 
 // A pointer to uncompressed values and the number of values.

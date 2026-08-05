@@ -41,6 +41,7 @@ const bitpacked_quantization = @import("lossy_compression/value_representation/b
 const serfqt = @import("lossy_compression/value_representation/serf_qt.zig");
 const buff = @import("lossy_compression/value_representation/bounded_fast_floats.zig");
 const macaque = @import("lossy_compression/value_representation/macaque.zig");
+const camel = @import("lossy_compression/value_representation/camel.zig");
 
 // Import line simplification methods.
 const vw = @import("lossy_compression/line_simplification/visvalingam_whyatt.zig");
@@ -55,6 +56,8 @@ const rle_encoding = @import("lossless_compression/run_length_encoding.zig");
 const delta_encoding = @import("lossless_compression/bitpacked_delta_encoding.zig");
 const chimp64 = @import("lossless_compression/chimp64.zig");
 const chimp128 = @import("lossless_compression/chimp128.zig");
+const elf = @import("lossless_compression/elf.zig");
+const lttb = @import("lossy_compression/line_simplification/largest_triangle_three_buckets.zig");
 const elf_plus = @import("lossless_compression/elf_plus.zig");
 
 const extractors = @import("utilities/extractors.zig");
@@ -106,6 +109,9 @@ pub const Method = enum {
     DiscreteFourierTransform,
     MacaqueS,
     MacaqueV,
+    LargestTriangleThreeBuckets,
+    Elf,
+    Camel,
     ElfPlus,
 };
 
@@ -132,6 +138,12 @@ pub fn compress(
     }
 
     switch (method) {
+        .Uncompressed => {
+            for (uncompressed_values) |value| {
+                const value_as_bytes: [8]u8 = @bitCast(value);
+                try compressed_values.appendSlice(allocator, value_as_bytes[0..]);
+            }
+        },
         .PoorMansCompressionMidrange => {
             try poor_mans_compression.compressMidrange(
                 allocator,
@@ -324,6 +336,29 @@ pub fn compress(
                 configuration,
             );
         },
+        .Elf => {
+            try elf.compress(
+                allocator,
+                uncompressed_values,
+                &compressed_values,
+                configuration,
+            );
+        },
+        .LargestTriangleThreeBuckets => {
+            try lttb.compress(
+                allocator,
+                uncompressed_values,
+                &compressed_values,
+                configuration,
+            );
+        },
+        .Camel => {
+            try camel.compress(
+                allocator,
+                uncompressed_values,
+                &compressed_values,
+                configuration,
+            );
         .ElfPlus => {
             try elf_plus.compress(
                 allocator,
@@ -365,6 +400,14 @@ pub fn decompress(
     const compressed_values_slice = compressed_values[0 .. compressed_values.len - 1];
 
     switch (method) {
+        .Uncompressed => {
+            if (compressed_values_slice.len % 8 != 0) return Error.CorruptedCompressedData;
+            var offset: usize = 0;
+            while (offset < compressed_values_slice.len) : (offset += 8) {
+                const value: f64 = @bitCast(compressed_values_slice[offset..][0..8].*);
+                try decompressed_values.append(allocator, value);
+            }
+        },
         .PoorMansCompressionMidrange, .PoorMansCompressionMean => {
             try poor_mans_compression.decompress(allocator, compressed_values_slice, &decompressed_values);
         },
@@ -431,6 +474,14 @@ pub fn decompress(
         .MacaqueV => {
             try macaque.decompressMacaqueV(allocator, compressed_values_slice, &decompressed_values);
         },
+        .Elf => {
+            try elf.decompress(allocator, compressed_values_slice, &decompressed_values);
+        },
+        .LargestTriangleThreeBuckets => {
+            try lttb.decompress(allocator, compressed_values_slice, &decompressed_values);
+        },
+        .Camel => {
+            try camel.decompress(allocator, compressed_values_slice, &decompressed_values);
         .ElfPlus => {
             try elf_plus.decompress(allocator, compressed_values_slice, &decompressed_values);
         },
@@ -573,6 +624,14 @@ pub fn extract(
                 coefficients,
             );
         },
+        .LargestTriangleThreeBuckets => {
+            try lttb.extract(
+                allocator,
+                compressed_values_slice,
+                indices,
+                coefficients,
+            );
+        },
         // For the following three methods, it is not possible to guarantee
         // that the pipeline will work as intended. This is because even small
         // chages in the compressed representation can lead to large differences
@@ -597,8 +656,12 @@ pub fn extract(
         .Chimp128,
         .MacaqueS,
         .MacaqueV,
+        .Camel,
         .ElfPlus,
         => {
+            return Error.UnsupportedMethod;
+        },
+        .Elf => {
             return Error.UnsupportedMethod;
         },
     }
@@ -724,6 +787,14 @@ pub fn rebuild(
                 &compressed_values,
             );
         },
+        .LargestTriangleThreeBuckets => {
+            try lttb.rebuild(
+                allocator,
+                indices,
+                coefficients,
+                &compressed_values,
+            );
+        },
         // For the following three methods, it is not possible to guarantee
         // that the pipeline will work as intended. This is because even small
         // chages in the compressed representation can lead to large differences
@@ -748,8 +819,12 @@ pub fn rebuild(
         .Chimp128,
         .MacaqueS,
         .MacaqueV,
+        .Camel,
         .ElfPlus,
         => {
+            return Error.UnsupportedMethod;
+        },
+        .Elf => {
             return Error.UnsupportedMethod;
         },
     }
@@ -790,6 +865,9 @@ test "extract and rebuild works for any compression method supported" {
             method == Method.Chimp64 or
             method == Method.Chimp128 or
             method == Method.MacaqueS or
+            method == Method.MacaqueV or
+            method == Method.Elf or
+            method == Method.Camel)
             method == Method.MacaqueV or
             method == Method.ElfPlus)
         {

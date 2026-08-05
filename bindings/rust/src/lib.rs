@@ -52,6 +52,9 @@ pub enum Method {
     DiscreteFourierTransform,
     MacaqueS,
     MacaqueV,
+    LargestTriangleThreeBuckets,
+    Elf,
+    Camel,
     ElfPlus,
 }
 

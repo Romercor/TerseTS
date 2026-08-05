@@ -159,7 +159,10 @@ class Method(Enum):
     DiscreteFourierTransform = 22
     MacaqueS = 23
     MacaqueV = 24
-    ElfPlus = 25
+    LargestTriangleThreeBuckets = 25
+    Elf = 26
+    Camel = 27
+    ElfPlus = 28
 
 
 # Public API.
