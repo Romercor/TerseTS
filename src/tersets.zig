@@ -368,12 +368,6 @@ pub fn compress(
                 configuration,
             );
         },
-        .Uncompressed => {
-            for (uncompressed_values) |value| {
-                const value_as_bytes: [8]u8 = @bitCast(value);
-                try compressed_values.appendSlice(allocator, value_as_bytes[0..]);
-            }
-        },
     }
     try compressed_values.append(allocator, @intFromEnum(method));
     return compressed_values;
@@ -486,14 +480,6 @@ pub fn decompress(
         },
         .ElfPlus => {
             try elf_plus.decompress(allocator, compressed_values_slice, &decompressed_values);
-        },
-        .Uncompressed => {
-            if (compressed_values_slice.len % 8 != 0) return Error.CorruptedCompressedData;
-            var offset: usize = 0;
-            while (offset < compressed_values_slice.len) : (offset += 8) {
-                const value: f64 = @bitCast(compressed_values_slice[offset..][0..8].*);
-                try decompressed_values.append(allocator, value);
-            }
         },
     }
 
